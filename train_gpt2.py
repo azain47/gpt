@@ -91,7 +91,7 @@ def get_lr(iter):
     
     # use cosine decay for rest
     decay = (iter - warmup_steps) / (max_steps - warmup_steps)
-    coeff = 0.5 + (1.0 + math.cos(math.pi * decay))
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay))
     
     # adding min_lr to not let the lr reach zero.
     return min_lr + coeff * (max_lr - min_lr)
