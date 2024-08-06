@@ -1,25 +1,27 @@
-# import model
 from gpt2 import GPT2, GPTConfig
-# import tokenizer
-import tiktoken
-# misc
-import torch
-import math, os, time
-# import matplotlib.pyplot as plt
+
+import torch, time, math, os
+import pickle
+import random
+import matplotlib.pyplot as plt
+from typing import Dict, Optional, Literal
 
 # Dataset Loader
 class DataLoader():
-    def __init__(self, B, T, file):
+    def __init__(self, B, T, split):
         self.B = B
-        self.T = T
+        self.T = T      
         
-        with open(os.path.join(file)) as f:
-            text = f.read()
+        datasets = os.listdir('./dataset')
+        file = [s for s in datasets if split in s] 
+        # tokens = read_file(os.path.join('./dataset/', file[0]))
+        with open((os.path.join('./dataset/', file[0])), 'rb') as f:
+            self.documents = pickle.load(f)
         
-        # tokenizer 
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        # self.tokens = tokens
+        self.shuffle_docs()
+        self.flatten_docs()
+
         self.num_batches = len(self.tokens)//(B*T)
 
         print(f'Total tokens:{len(self.tokens)}')
@@ -27,6 +29,20 @@ class DataLoader():
         # pointer to manage batches
         self.curr = 0    
     
+    def shuffle_docs(self):
+        random.shuffle(self.documents)
+    
+    def flatten_docs(self):
+        tokens = []
+        for doc in self.documents:
+            tokens.extend(doc)
+        self.tokens = torch.tensor(tokens, dtype=torch.long)
+    
+    def reset(self):
+        self.shuffle_docs()
+        self.flatten_docs()
+        self.curr = 0
+
     def get_next_batch(self):
         
         buf = self.tokens[self.curr : self.curr + (self.B * self.T) + 1]
@@ -37,7 +53,7 @@ class DataLoader():
         self.curr += self.B * self.T
 
         if (self.curr + (self.B * self.T) + 1) > len(self.tokens):
-            self.curr = 0
+            self.reset()
 
         return x, y 
 
@@ -78,7 +94,8 @@ print(f'Model Size : {(sum(p.numel() for p in model.parameters())/1e6):.1f} M pa
 torch.set_float32_matmul_precision('high')
 
 # Dataset Load
-train_loader = DataLoader(mini_batch_size, context_length, 'shakespeare.txt')
+train_loader = DataLoader(mini_batch_size, context_length, 'train')
+val_loader = DataLoader(mini_batch_size, context_length, 'val')
 
 # GPT2 LR Schedule, Linear Warmup followed by cosine decay.
 def get_lr(iter):
@@ -98,11 +115,55 @@ def get_lr(iter):
 
 optimizer = torch.optim.AdamW(model.parameters(), lr = max_lr, betas=(0.9,0.95))
 
-# Finally, Train the model.
+# grokFast algo
+def gradfilter_ema(
+    m: torch.nn.Module,
+    grads: Optional[Dict[str, torch.Tensor]] = None,
+    alpha: float = 0.9,
+    lamb: float = 2.0,
+) -> Dict[str, torch.Tensor]:
+    if grads is None:
+        grads = {n: p.grad.data.detach() for n, p in m.named_parameters() if p.requires_grad}
 
-losses = []
+    for n, p in m.named_parameters():
+        if p.requires_grad:
+            grads[n] = grads[n] * alpha + p.grad.data.detach() * (1 - alpha)
+            p.grad.data = p.grad.data + grads[n] * lamb
+
+    return grads
+
+# Finally, Train the model.
+grads = None
+val_loss = 0
+train_losses = []
+val_losses = []
 for step in range(max_steps):
     t0 = time.time()
+
+    # validation loss every 5 steps
+    if step % 5 == 0:       
+        model.eval()
+        with torch.no_grad():
+            val_loss = 0
+            for _ in range(min(grad_accum_steps,10)):
+                x, y = val_loader.get_next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                    # compensate for accumulation due to 'mean' reduction in the loss function.
+                    loss = loss / min(grad_accum_steps,10)
+                    # compute gradients
+                    val_loss+= loss.detach().cpu()
+                            
+        print(f'Validation Loss: {val_loss:.5f}')
+    val_losses.append(val_loss)
+    # lets also save the model every... 150 steps
+    if step % 150 == 0:
+        torch.save(model.state_dict(),f'./models/GPT-iter{step}.pt')
+
+    # usual training loop
+    model.train()
+
     optimizer.zero_grad()
     loss_accum = 0
     for mini_step in range(grad_accum_steps):
@@ -113,11 +174,13 @@ for step in range(max_steps):
         # compensate for accumulation due to 'mean' reduction in the loss function.
         loss = loss / grad_accum_steps
         # compute gradients
-        loss_accum+= loss.detach()
+        loss_accum+= loss.detach().cpu()
         loss.backward()
     
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
+    # accelerating slow gradients, for better generalization performance.
+    # if step > 130:
+    #     grads = gradfilter_ema(model, grads=grads)
     lr = get_lr(step)
     
     for param_grp in optimizer.param_groups:
@@ -128,9 +191,17 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1-t0)
     tokens_processed_ps = train_loader.B * train_loader.T * grad_accum_steps / dt
-    losses.append(loss_accum)
+    train_losses.append(loss_accum)
     print(f"step{step+1} | loss:{loss_accum.item():.5f} | lr: {lr:.3e} | t:{dt*1000:.2f}ms | norm: {norm.detach():.3f} | tok/s: {tokens_processed_ps:.2f}")
 
 # save model
-
-torch.save(model.state_dict(), 'GPT2-Shakespeare.pt')
+torch.save(model.state_dict(), 'GPT.pt')
+# plot losses
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Training Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Training and Validation Losses')
+plt.legend()
+plt.show()
